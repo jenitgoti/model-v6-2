@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+Split_Data/
+runs/
+.venv-metal/
+.DS_Store

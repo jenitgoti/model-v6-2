@@ -1,4 +1,8 @@
-"""Model_v6.2: scratch instance segmentation for 4-class PCB features.
+"""Model_v6.3: instance segmentation for 4-class PCB features.
+
+Model_v6.2 with every defect found in review corrected. Configured out of
+the box for the WSL box with the RTX PRO 1000 and the Model_v5 checkpoint
+at TRANSFER_SOURCE_MODEL below. Run RUN_MODE = "selftest" first.
 
 This single file deliberately owns every stage that must agree:
 
@@ -155,7 +159,7 @@ ARRAY_DIR = DATASET_ROOT / "instance_npy_512_letterbox_v6"
 MODEL_OUTPUT_DIR = Path(
     os.environ.get(
         "PCB_MODEL_OUTPUT_DIR",
-        "/home/u117134c/Models/Model_v6_2_v5_augmentation",
+        "/home/u117134c/Models/Model_v6_3_scratch",
     )
 )
 
@@ -164,9 +168,11 @@ RUN_MODE = "transfer"
 
 PREDICT_SOURCE = DATASET_ROOT / "images" / "test"
 MODEL_FOR_INFERENCE = Path(
-    "/home/u117134c/Models/Model_v6_2_from_v5_transfer/"
-    "best_transfer_model_v6_2_instance.keras"
-)
+    os.environ.get(
+        "PCB_TRANSFER_OUTPUT_DIR",
+        "/home/u117134c/Models/Model_v6_3_from_v5_transfer",
+    )
+) / "best_transfer_model_v6_2_instance.keras"
 
 # Image preparation. Value 114 is the same neutral padding used at prediction.
 LETTERBOX_FILL_VALUE = 114
@@ -215,7 +221,7 @@ EARLY_STOPPING_START_EPOCH = AUGMENTATION_CYCLE_LENGTH
 # epoch can never become authoritative merely because it was trained last.
 FINE_TUNE_SOURCE_MODEL = MODEL_FOR_INFERENCE
 FINE_TUNE_OUTPUT_DIR = Path(
-    "/home/u117134c/Models/Model_v6_2_fine_tuned"
+    "/home/u117134c/Models/Model_v6_3_fine_tuned"
 )
 # Keep this equal to ARRAY_DIR to refine on the original prepared data, or point
 # it at another V6-compatible prepared dataset for domain adaptation.
@@ -242,10 +248,16 @@ FINE_TUNED_MODEL_FOR_INFERENCE = (
 # layers must NOT be copied. Only the audited homologous p4/p5/SPPF/attention
 # layers are eligible, and every complete layer weight list must match exactly.
 TRANSFER_SOURCE_MODEL = Path(
-    "/home/u117134c/Models/Model_v5_instance/best_model_v5_instance.keras"
+    os.environ.get(
+        "PCB_V5_CHECKPOINT",
+        "/home/u117134c/Models/Model_v5_instance/best_model_v5_instance.keras",
+    )
 )
 TRANSFER_OUTPUT_DIR = Path(
-    "/home/u117134c/Models/Model_v6_2_from_v5_transfer"
+    os.environ.get(
+        "PCB_TRANSFER_OUTPUT_DIR",
+        "/home/u117134c/Models/Model_v6_3_from_v5_transfer",
+    )
 )
 TRANSFER_ARRAY_DIR = ARRAY_DIR
 TRANSFER_EPOCHS = 220
@@ -343,20 +355,6 @@ SATURATION_GAIN_RANGE = (0.92, 1.08)
 MIN_AUGMENTED_INSTANCE_AREA = max(
     4, int(round(0.000015 * IMG_SIZE * IMG_SIZE))
 )
-
-# Copy-paste augmentation (Ghiasi et al., 2021). Per-pixel instance ids are
-# already stored, so extraction is free. Two measured problems make this the
-# highest-value augmentation available here:
-#   * Rectangle_concave has 680 training polygons (0.47% of all polygons) and
-#     is the worst class by a wide margin. Donors are drawn by picking a class
-#     uniformly first, which lifts its exposure from 0.47% to ~25%.
-#   * V5 epoch 356 had train centre loss 0.032 against val 1.032 - the centre
-#     head memorises. Pasting objects into new contexts breaks that.
-# The paste alpha is feathered so a hard cut never becomes the boundary cue.
-USE_COPY_PASTE_AUGMENTATION = True
-COPY_PASTE_PROBABILITY = 0.50
-COPY_PASTE_MAX_OBJECTS = 3
-COPY_PASTE_EDGE_FEATHER_PX = 1.5
 
 # One consistent target definition for original and augmented samples.
 CENTER_SIGMA_RANGE = (1.5, 5.0)
@@ -804,7 +802,7 @@ def prepare_dataset() -> None:
     ARRAY_DIR.mkdir(parents=True, exist_ok=True)
 
     summary: dict[str, object] = {
-        "version": "Model_v6.1_v5_augmentation",
+        "version": "Model_v6.3",
         "dataset_root": str(DATASET_ROOT),
         "array_dir": str(ARRAY_DIR),
         "image_size": IMG_SIZE,
@@ -1505,92 +1503,6 @@ def apply_dihedral_transform(
     )
 
 
-def copy_paste_objects(
-    image: np.ndarray,
-    semantic: np.ndarray,
-    instance: np.ndarray,
-    donor_image: np.ndarray,
-    donor_semantic: np.ndarray,
-    donor_instance: np.ndarray,
-    rng: np.random.Generator,
-    max_objects: int = COPY_PASTE_MAX_OBJECTS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Paste a few whole donor instances onto this sample.
-
-    Occlusion remnants are not handled here: ``build_all_targets`` runs
-    ``sanitize_semantic_and_instances``, which drops any instance a paste has
-    cut below ``MIN_TARGET_INSTANCE_AREA_FULL_RES``.
-    """
-    donor_ids = np.unique(donor_instance)
-    donor_ids = donor_ids[donor_ids > 0]
-    if donor_ids.size == 0:
-        return image, semantic, instance
-
-    image = np.array(image, dtype=np.float32, copy=True)
-    semantic = np.array(semantic, dtype=np.int32, copy=True)
-    instance = np.array(instance, dtype=np.int32, copy=True)
-    next_id = int(instance.max()) + 1
-
-    wanted = int(rng.integers(1, int(max_objects) + 1))
-    chosen = rng.choice(
-        donor_ids, size=min(wanted, donor_ids.size), replace=False
-    )
-    for donor_id in chosen:
-        if next_id > MAX_INSTANCE_ID:
-            break
-        mask = donor_instance == int(donor_id)
-        rows = np.flatnonzero(mask.any(axis=1))
-        cols = np.flatnonzero(mask.any(axis=0))
-        if rows.size == 0 or cols.size == 0:
-            continue
-        classes = np.bincount(
-            donor_semantic[mask].astype(np.int64), minlength=NUM_CLASSES
-        )
-        classes[0] = 0
-        if classes.sum() == 0:
-            continue
-        class_id = int(classes.argmax())
-
-        top, bottom = int(rows[0]), int(rows[-1]) + 1
-        left, right = int(cols[0]), int(cols[-1]) + 1
-        crop_mask = mask[top:bottom, left:right]
-        crop_rgb = donor_image[top:bottom, left:right]
-
-        # An exact dihedral transform on the crop so a paste is never a pixel
-        # copy of the donor. Every class here is dihedrally symmetric.
-        quarter_turns = int(rng.integers(4))
-        crop_mask = np.rot90(crop_mask, quarter_turns)
-        crop_rgb = np.rot90(crop_rgb, quarter_turns)
-        if rng.random() < 0.5:
-            crop_mask = crop_mask[:, ::-1]
-            crop_rgb = crop_rgb[:, ::-1]
-        crop_mask = np.ascontiguousarray(crop_mask)
-        crop_rgb = np.ascontiguousarray(crop_rgb, dtype=np.float32)
-
-        height, width = crop_mask.shape
-        if (
-            height >= IMG_SIZE
-            or width >= IMG_SIZE
-            or int(crop_mask.sum()) < MIN_TARGET_INSTANCE_AREA_FULL_RES
-        ):
-            continue
-        y = int(rng.integers(0, IMG_SIZE - height))
-        x = int(rng.integers(0, IMG_SIZE - width))
-        window = (slice(y, y + height), slice(x, x + width))
-
-        alpha = cv2.GaussianBlur(
-            crop_mask.astype(np.float32),
-            (0, 0),
-            float(COPY_PASTE_EDGE_FEATHER_PX),
-        )[..., None]
-        image[window] = image[window] * (1.0 - alpha) + crop_rgb * alpha
-        semantic[window][crop_mask] = class_id
-        instance[window][crop_mask] = next_id
-        next_id += 1
-
-    return image, semantic, instance
-
-
 # =============================================================================
 # 6. MEMORY-MAPPED BATCH LOADER
 # =============================================================================
@@ -1665,7 +1577,6 @@ class InstanceArraySequence(tf.keras.utils.Sequence):
         self.seed_offset = int(seed_offset)
         self.epoch_index = 0
         self.indices = np.arange(len(self.images), dtype=np.int64)
-        self._donor_index: dict[int, np.ndarray] | None = None
         self.order_rng = np.random.default_rng(
             SEED + self.seed_offset + (1 if training else 2)
         )
@@ -1680,46 +1591,6 @@ class InstanceArraySequence(tf.keras.utils.Sequence):
             self.epoch_index += 1
             if self.shuffle:
                 self.order_rng.shuffle(self.indices)
-
-    def donor_sample_index(self, rng: np.random.Generator) -> int:
-        """Draw a donor biased towards the rare classes.
-
-        A class is chosen uniformly first and the donor only then, so
-        Rectangle_concave (0.47% of polygons) donates as often as
-        circle_full (52.6%). The index costs one pass over the semantic
-        memmap at first use and is kept for the life of the sequence.
-        """
-        if self._donor_index is None:
-            present: dict[int, list[int]] = {
-                class_id: [] for class_id in range(1, NUM_CLASSES)
-            }
-            for position in range(len(self.semantic)):
-                counts = np.bincount(
-                    np.asarray(self.semantic[position]).ravel(),
-                    minlength=NUM_CLASSES,
-                )
-                for class_id in range(1, NUM_CLASSES):
-                    if counts[class_id]:
-                        present[class_id].append(position)
-            self._donor_index = {
-                class_id: np.asarray(positions, dtype=np.int64)
-                for class_id, positions in present.items()
-                if positions
-            }
-            print(
-                "Copy-paste donor pool: "
-                + ", ".join(
-                    f"{CLASS_NAMES[class_id]}={len(positions)}"
-                    for class_id, positions in sorted(
-                        self._donor_index.items()
-                    )
-                ),
-                flush=True,
-            )
-        if not self._donor_index:
-            return int(rng.integers(len(self.images)))
-        class_id = int(rng.choice(sorted(self._donor_index)))
-        return int(rng.choice(self._donor_index[class_id]))
 
     def augmentation_mode_for_sample(self, sample_index: int) -> int:
         """Give every image all 95 V5 modes once per 95 epochs."""
@@ -1804,22 +1675,6 @@ class InstanceArraySequence(tf.keras.utils.Sequence):
                     instance,
                     int(dihedral_rng.integers(8)),
                 )
-
-            if self.training and USE_COPY_PASTE_AUGMENTATION:
-                copy_paste_rng = self.augmentation_rng_for_sample(
-                    int(sample_index), salt=2
-                )
-                if copy_paste_rng.random() < COPY_PASTE_PROBABILITY:
-                    donor = self.donor_sample_index(copy_paste_rng)
-                    image, semantic, instance = copy_paste_objects(
-                        image,
-                        semantic,
-                        instance,
-                        normalize_image(self.images[donor]),
-                        np.asarray(self.semantic[donor], dtype=np.int32),
-                        np.asarray(self.instance[donor], dtype=np.int32),
-                        copy_paste_rng,
-                    )
 
             semantic, center, offset, boundary = build_all_targets(
                 semantic, instance
@@ -4186,11 +4041,7 @@ def build_model_v6_2_instance(
         name="instance_context",
     )
 
-    # Dedicated semantic/boundary decoder: 1/8 -> 1/4 -> 1/2. The two logit
-    # maps are bilinearly upsampled to full resolution at the very end.
-    # 41% of this model's MACs used to sit in the 512x512 stage; measured
-    # object diameters here are 16-36 px, so half-resolution features plus a
-    # smooth logit upsample cost far less accuracy than they buy in speed.
+    # Dedicated semantic/boundary decoder: 1/8 -> 1/4 -> 1/2 -> full.
     semantic_p2 = C3k2(
         layers.Concatenate(name="semantic_p2_skip_concat")(
             [upsample(semantic_context, 2, "semantic_context_up"), p2]
@@ -4207,10 +4058,9 @@ def build_model_v6_2_instance(
         2,
         "semantic_p1",
     )
-    detail_half = Conv(detail, 24, 3, 2, "detail_half")
     semantic_full = C3k2(
         layers.Concatenate(name="semantic_full_skip_concat")(
-            [semantic_p1, detail_half]
+            [upsample(semantic_p1, 2, "semantic_p1_up"), detail]
         ),
         56,
         2,
@@ -4242,14 +4092,8 @@ def build_model_v6_2_instance(
         kernel_initializer="glorot_uniform",
         bias_initializer=tf.keras.initializers.Constant(-2.94),
         dtype="float32",
-        name="boundary_logits_half",
-    )(boundary_features)
-    boundary_logits = layers.UpSampling2D(
-        2,
-        interpolation="bilinear",
-        dtype="float32",
         name="boundary",
-    )(boundary_logits)
+    )(boundary_features)
 
     semantic_features = C3k2(
         layers.Concatenate(name="semantic_boundary_concat")(
@@ -4265,14 +4109,8 @@ def build_model_v6_2_instance(
         padding="same",
         kernel_initializer="glorot_uniform",
         dtype="float32",
-        name="semantic_logits_half",
-    )(semantic_features)
-    semantic_logits = layers.UpSampling2D(
-        2,
-        interpolation="bilinear",
-        dtype="float32",
         name="semantic",
-    )(semantic_logits)
+    )(semantic_features)
 
     # Dedicated instance decoder: 1/8 -> 1/4 -> 1/2.
     instance_p2 = C3k2(
@@ -4295,8 +4133,8 @@ def build_model_v6_2_instance(
     boundary_half = Conv(
         boundary_features,
         24,
-        1,
-        1,
+        3,
+        2,
         "boundary_half",
     )
     instance_features = C3k2(
@@ -17695,56 +17533,6 @@ def run_selftest() -> None:
     else:
         assert np.allclose(batch_images[0], raw_image, atol=1e-6)
 
-    # --- 6b. copy-paste adds whole, single-class, target-able instances -----
-    paste_rng = np.random.default_rng(11)
-    host_image = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
-    host_semantic = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.int32)
-    host_instance = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.int32)
-    host_image[10:60, 10:60] = 0.5
-    host_semantic[10:60, 10:60] = 1
-    host_instance[10:60, 10:60] = 1
-
-    donor_image = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
-    donor_semantic = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.int32)
-    donor_instance = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.int32)
-    donor_image[100:140, 200:280] = 1.0
-    donor_semantic[100:140, 200:280] = 2
-    donor_instance[100:140, 200:280] = 7
-    donor_image[300:330, 300:330] = 0.25
-    donor_semantic[300:330, 300:330] = 3
-    donor_instance[300:330, 300:330] = 9
-
-    pasted_image, pasted_semantic, pasted_instance = copy_paste_objects(
-        host_image,
-        host_semantic,
-        host_instance,
-        donor_image,
-        donor_semantic,
-        donor_instance,
-        paste_rng,
-        max_objects=2,
-    )
-    assert int(host_instance.max()) == 1 and int(host_semantic.max()) == 1, (
-        "copy_paste_objects mutated its inputs; the memmap-backed caller "
-        "would corrupt the dataset"
-    )
-    pasted_ids = [
-        int(value) for value in np.unique(pasted_instance) if int(value) != 0
-    ]
-    assert len(pasted_ids) >= 2, (
-        f"copy-paste produced no new instance: ids {pasted_ids}"
-    )
-    for pasted_id in pasted_ids:
-        pasted_classes = np.unique(pasted_semantic[pasted_instance == pasted_id])
-        assert pasted_classes.size == 1 and int(pasted_classes[0]) > 0, (
-            f"instance {pasted_id} is not a single foreground class: "
-            f"{pasted_classes.tolist()}"
-        )
-    _, paste_center, _, _ = build_all_targets(pasted_semantic, pasted_instance)
-    assert int((paste_center > 0.99).sum()) >= len(pasted_ids), (
-        "pasted instances did not each produce a centre peak"
-    )
-
     # --- 7. the model actually builds -------------------------------------
     # Keras rejects duplicate operation names, and C3k2(x, ..., "foo") creates
     # a layer called "foo_concat" internally. A skip connection named
@@ -17830,7 +17618,6 @@ def run_selftest() -> None:
     print("  all 8 dihedral transforms are exact and label-preserving")
     print("  zoom-out shrinks content and pads with the letterbox value")
     print("  the batch loader emits valid four-head targets in every mode")
-    print("  copy-paste adds whole single-class instances with centre peaks")
     print(
         f"  the model builds: {len(layer_names)} layers, "
         f"{parameter_count:,} parameters, no duplicate names"
